@@ -34,6 +34,7 @@ body {
 #app {
   display: flex;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -109,8 +110,19 @@ body {
 #sidebar-content {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
   min-height: 0;
-  padding: 12px;
+  padding: 12px 12px calc(120px + env(safe-area-inset-bottom));
+  scroll-padding-bottom: calc(120px + env(safe-area-inset-bottom));
+}
+
+#sidebar-content::after {
+  content: '';
+  display: block;
+  height: calc(80px + env(safe-area-inset-bottom));
 }
 
 #add-section,
@@ -656,6 +668,15 @@ details.advanced .field { margin-top: 8px; }
 @media (max-width: 1024px) {
   :root {
     --sidebar-w: 320px;
+  }
+
+  #sidebar-content {
+    padding-bottom: calc(170px + env(safe-area-inset-bottom));
+    scroll-padding-bottom: calc(170px + env(safe-area-inset-bottom));
+  }
+
+  #sidebar-content::after {
+    height: calc(120px + env(safe-area-inset-bottom));
   }
 }
 

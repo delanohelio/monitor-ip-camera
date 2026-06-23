@@ -941,6 +941,69 @@ async function addCamera(data) {
   }
 }
 
+async function clearAllCamerasForReset() {
+  const current = [...state.cameras];
+  for (const cam of current) {
+    try {
+      await apiFetch('DELETE', `/api/cameras/${cam.id}`);
+    } catch {
+      // Continue cleanup even if one delete fails.
+    }
+    destroyPlayer(cam.id);
+    removeStoredCameraConfigByKey(cameraConfigKeyById.get(cam.id));
+    cameraConfigKeyById.delete(cam.id);
+    cameraConfigById.delete(cam.id);
+    cameraUiState.delete(cam.id);
+    reconnectState.delete(cam.id);
+  }
+  state.cameras = [];
+  renderList();
+  renderGrid();
+}
+
+async function fetchDefaultCameraConfigs() {
+  const defaults = await apiFetch('GET', '/api/default-cameras');
+  if (!Array.isArray(defaults)) return [];
+
+  return defaults
+    .map((cfg) => sanitizeCameraConfig(cfg))
+    .filter((cfg) => cfg.ip && cfg.login && cfg.password);
+}
+
+async function restoreDefaultCameras(options = {}) {
+  const { replaceExisting = false, notify = true } = options;
+
+  let defaults = [];
+  try {
+    defaults = await fetchDefaultCameraConfigs();
+  } catch (err) {
+    if (notify) toast(`Falha ao carregar defaults: ${err.message}`, 'error');
+    return 0;
+  }
+
+  if (!defaults.length) {
+    if (notify) toast('Arquivo de defaults vazio ou não configurado', 'error');
+    return 0;
+  }
+
+  if (replaceExisting) {
+    await clearAllCamerasForReset();
+    saveStoredCameraConfigs([]);
+  }
+
+  let addedCount = 0;
+  for (const cfg of defaults) {
+    const ok = await addCamera(cfg);
+    if (ok) addedCount += 1;
+  }
+
+  if (notify) {
+    toast(`Defaults aplicados: ${addedCount} câmera(s)`, addedCount > 0 ? 'success' : 'error');
+  }
+
+  return addedCount;
+}
+
 async function removeCamera(id) {
   const cam = state.cameras.find((c) => c.id === id);
   if (!cam) return;
@@ -1109,6 +1172,13 @@ document.getElementById('add-toggle-btn').addEventListener('click', () => {
   addSection.hidden = !addSection.hidden;
 });
 
+document.getElementById('reset-defaults-btn').addEventListener('click', async () => {
+  const ok = confirm('Restaurar padrão irá substituir as câmeras atuais pela configuração do arquivo default. Continuar?');
+  if (!ok) return;
+
+  await restoreDefaultCameras({ replaceExisting: true, notify: true });
+});
+
 document.getElementById('edit-cancel-btn').addEventListener('click', () => {
   closeEditModal();
 });
@@ -1124,15 +1194,20 @@ document.getElementById('edit-modal').addEventListener('click', (e) => {
 
 async function restoreSavedCameras() {
   const saved = getStoredCameraConfigs();
-  if (!saved.length) return;
+  if (!saved.length) return 0;
+
+  let addedCount = 0;
 
   for (const cfg of saved) {
     const ok = await addCamera(cfg);
     if (ok) {
       const added = state.cameras[state.cameras.length - 1];
       if (added) cameraConfigKeyById.set(added.id, cfg.key);
+      addedCount += 1;
     }
   }
+
+  return addedCount;
 }
 
 function applyPowerSettingsUI() {
@@ -1213,11 +1288,17 @@ function setupHealthMonitor() {
     renderList();
     renderGrid();
     if (state.cameras.length === 0) {
-      await restoreSavedCameras();
+      const restored = await restoreSavedCameras();
+      if (restored === 0) {
+        await restoreDefaultCameras({ replaceExisting: false, notify: false });
+      }
     }
   } catch {
     toast('Não foi possível carregar as câmeras', 'error');
     renderGrid(); // show empty state
-    await restoreSavedCameras();
+    const restored = await restoreSavedCameras();
+    if (restored === 0) {
+      await restoreDefaultCameras({ replaceExisting: false, notify: false });
+    }
   }
 })();

@@ -13,10 +13,14 @@ const PUBLIC_DIR  = path.join(__dirname, 'public');
 const configuredToken = (process.env.ACCESS_TOKEN || process.env.IPCAM_ACCESS_TOKEN || '').trim();
 const ACCESS_TOKEN = configuredToken || crypto.randomBytes(24).toString('base64url');
 const ACCESS_TOKEN_SOURCE = configuredToken ? 'env' : 'generated';
+const DEFAULT_CAMERAS_FILE = (process.env.DEFAULT_CAMERAS_FILE || '').trim();
+const VIEWER_TTL_MS = Math.max(5000, parseInt(process.env.VIEWER_TTL_MS || '30000', 10) || 30000);
+const EMPTY_CAMERA_GRACE_MS = Math.max(5000, parseInt(process.env.EMPTY_CAMERA_GRACE_MS || '45000', 10) || 45000);
 
 /** In-memory state */
 const cameras    = new Map(); // id -> { id, name, rtspUrl, process, hlsDir, transportIndex, forceTranscode }
 let   cameraOrder = [];       // ordered array of ids
+const cameraViewers = new Map(); // cameraId -> Map(clientId(ip:port), lastSeenMs)
 
 fs.mkdirSync(STREAMS_DIR, { recursive: true });
 
@@ -82,6 +86,68 @@ function isValidHost(s) {
   return /^[\w.-]{1,253}$/.test(s) && !/\.\./.test(s);
 }
 
+function parseDefaultCamera(item, index) {
+  if (!item || typeof item !== 'object') return null;
+
+  const ip = String(item.ip || '').trim();
+  const login = String(item.login || '').trim();
+  const password = String(item.password || '');
+  const name = String(item.name || ip).trim().slice(0, 100);
+  const port = String(item.port || '554').trim() || '554';
+  const streamPath = String(item.path || '/onvif1').trim() || '/onvif1';
+
+  if (!ip || !login || !password) {
+    console.warn(`[defaults] item ${index} ignorado: ip/login/password obrigatórios`);
+    return null;
+  }
+  if (!isValidHost(ip)) {
+    console.warn(`[defaults] item ${index} ignorado: host inválido (${ip})`);
+    return null;
+  }
+
+  const rtspPort = parseInt(port, 10) || 554;
+  if (rtspPort < 1 || rtspPort > 65535) {
+    console.warn(`[defaults] item ${index} ignorado: porta inválida (${port})`);
+    return null;
+  }
+
+  if (!/^\/[\w/.@-]*$/.test(streamPath)) {
+    console.warn(`[defaults] item ${index} ignorado: path inválido (${streamPath})`);
+    return null;
+  }
+
+  return {
+    name,
+    ip,
+    login,
+    password,
+    port: String(rtspPort),
+    path: streamPath,
+  };
+}
+
+function loadDefaultCameras() {
+  if (!DEFAULT_CAMERAS_FILE) return [];
+
+  try {
+    const raw = fs.readFileSync(DEFAULT_CAMERAS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      console.warn('[defaults] arquivo deve conter um array JSON');
+      return [];
+    }
+
+    const list = parsed
+      .map((item, idx) => parseDefaultCamera(item, idx))
+      .filter(Boolean);
+
+    return list;
+  } catch (err) {
+    console.warn(`[defaults] falha ao ler ${DEFAULT_CAMERAS_FILE}: ${err.message}`);
+    return [];
+  }
+}
+
 function parseCookies(cookieHeader) {
   const out = {};
   if (!cookieHeader) return out;
@@ -95,6 +161,60 @@ function parseCookies(cookieHeader) {
   });
 
   return out;
+}
+
+function getClientId(req) {
+  const xfwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const ip = xfwd || req.socket.remoteAddress || 'unknown';
+  const port = req.socket.remotePort || 0;
+  return `${ip}:${port}`;
+}
+
+function touchViewer(cameraId, clientId) {
+  const now = Date.now();
+  let viewers = cameraViewers.get(cameraId);
+  if (!viewers) {
+    viewers = new Map();
+    cameraViewers.set(cameraId, viewers);
+  }
+  viewers.set(clientId, now);
+
+  const camera = cameras.get(cameraId);
+  if (camera) camera.lastViewerAt = now;
+}
+
+function pruneStaleViewers(cameraId, now = Date.now()) {
+  const viewers = cameraViewers.get(cameraId);
+  if (!viewers) return 0;
+
+  for (const [clientId, lastSeen] of viewers.entries()) {
+    if (now - lastSeen > VIEWER_TTL_MS) {
+      viewers.delete(clientId);
+    }
+  }
+
+  if (viewers.size === 0) {
+    cameraViewers.delete(cameraId);
+    return 0;
+  }
+
+  return viewers.size;
+}
+
+function getViewerCount(cameraId) {
+  return pruneStaleViewers(cameraId);
+}
+
+function removeCameraById(id, reason = 'manual') {
+  const camera = cameras.get(id);
+  if (!camera) return false;
+
+  stopStream(camera);
+  cameras.delete(id);
+  cameraOrder = cameraOrder.filter((cid) => cid !== id);
+  cameraViewers.delete(id);
+  console.log(`[cam:${id.slice(0, 8)}] removida (${reason})`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +366,7 @@ const server = http.createServer(async (req, res) => {
   const urlObj   = new URL(req.url, 'http://localhost');
   const pathname = urlObj.pathname;
   const method   = req.method;
+  const clientId = getClientId(req);
   const tokenFromQuery = urlObj.searchParams.get('token');
   const cookies = parseCookies(req.headers.cookie || '');
   const tokenFromCookie = cookies.ipcam_token;
@@ -302,6 +423,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(403); res.end('Forbidden'); return;
     }
 
+    // Any valid HLS request from this client marks it as an active viewer.
+    touchViewer(cameraId, clientId);
+
     // Update lastHlsUpdate timestamp on successful HLS read
     fs.stat(filePath, (err) => {
       if (!err) {
@@ -320,14 +444,39 @@ const server = http.createServer(async (req, res) => {
         const c = cameras.get(id);
         const isRunning = !!c.process;
         const timeSinceUpdate = Date.now() - (c.lastHlsUpdate || 0);
+        const viewerCount = getViewerCount(id);
         return {
           id: c.id,
           name: c.name,
           running: isRunning,
+          viewerCount,
           staleSince: timeSinceUpdate > 20000 ? timeSinceUpdate : null, // null = OK, >20s = stale
         };
       });
     return sendJSON(res, 200, health);
+  }
+
+  // ── GET /api/viewers ─────────────────────────────────────────────────────
+  if (method === 'GET' && pathname === '/api/viewers') {
+    const list = cameraOrder
+      .filter((id) => cameras.has(id))
+      .map((id) => {
+        pruneStaleViewers(id);
+        const activeMap = cameraViewers.get(id) || new Map();
+        return {
+          cameraId: id,
+          cameraName: cameras.get(id).name,
+          viewerCount: activeMap.size,
+          viewers: [...activeMap.keys()],
+        };
+      });
+    return sendJSON(res, 200, list);
+  }
+
+  // ── GET /api/default-cameras ─────────────────────────────────────────────
+  if (method === 'GET' && pathname === '/api/default-cameras') {
+    const defaults = loadDefaultCameras();
+    return sendJSON(res, 200, defaults);
   }
 
   // ── GET /api/cameras ────────────────────────────────────────────────────
@@ -367,7 +516,15 @@ const server = http.createServer(async (req, res) => {
     const rtspUrl = `rtsp://${encodeURIComponent(login)}:${encodeURIComponent(password)}@${ip}:${rtspPort}${rtspPath}`;
     const camName = String(name || ip).slice(0, 100);
 
-    const camera = { id, name: camName, rtspUrl, transportIndex: 0, forceTranscode: false };
+    const camera = {
+      id,
+      name: camName,
+      rtspUrl,
+      transportIndex: 0,
+      forceTranscode: false,
+      createdAt: Date.now(),
+      lastViewerAt: 0,
+    };
     cameras.set(id, camera);
     cameraOrder.push(id);
     startStream(camera);
@@ -399,9 +556,7 @@ const server = http.createServer(async (req, res) => {
       if (!isValidUUID(id) || !cameras.has(id)) {
         return sendJSON(res, 404, { error: 'Câmera não encontrada' });
       }
-      stopStream(cameras.get(id));
-      cameras.delete(id);
-      cameraOrder = cameraOrder.filter((cid) => cid !== id);
+      removeCameraById(id, 'api-delete');
       return sendJSON(res, 200, { success: true });
     }
   }
@@ -477,6 +632,14 @@ server.listen(PORT, () => {
   console.log(`  Token (${ACCESS_TOKEN_SOURCE}) : ${ACCESS_TOKEN}`);
   console.log(`  Acesso: http://localhost:${PORT}/?token=${ACCESS_TOKEN}\n`);
   console.log('  Docker: passe -e ACCESS_TOKEN=<seu-token> para definir token fixo.');
+  console.log(`  Viewers TTL: ${VIEWER_TTL_MS}ms | Grace sem viewers: ${EMPTY_CAMERA_GRACE_MS}ms`);
+  if (DEFAULT_CAMERAS_FILE) {
+    const defaultsCount = loadDefaultCameras().length;
+    console.log(`  Defaults: ${DEFAULT_CAMERAS_FILE} (${defaultsCount} câmera(s) válida(s))`);
+    console.log('  Docker: monte o JSON e use -e DEFAULT_CAMERAS_FILE=/caminho/no/container');
+  } else {
+    console.log('  Defaults: desativado (defina -e DEFAULT_CAMERAS_FILE=/caminho/do/arquivo.json)');
+  }
   console.log('  Certifique-se que o ffmpeg está instalado.\n');
 });
 
@@ -486,7 +649,18 @@ server.listen(PORT, () => {
 
 setInterval(() => {
   const now = Date.now();
-  cameras.forEach((camera) => {
+  const snapshot = [...cameras.values()];
+  snapshot.forEach((camera) => {
+    const viewerCount = getViewerCount(camera.id);
+    if (viewerCount === 0) {
+      const idleSince = Math.max(camera.lastViewerAt || 0, camera.createdAt || 0);
+      const idleMs = now - idleSince;
+      if (idleMs > EMPTY_CAMERA_GRACE_MS) {
+        removeCameraById(camera.id, `sem viewers por ${(idleMs / 1000).toFixed(1)}s`);
+      }
+      return;
+    }
+
     if (!camera.process) return; // Skip if not running
 
     const timeSinceUpdate = now - (camera.lastHlsUpdate || 0);

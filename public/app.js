@@ -14,6 +14,10 @@ const cameraConfigKeyById = new Map();
 
 const STORAGE_CAMERAS_KEY = 'ipcam.saved-cameras.v1';
 const STORAGE_POWER_KEY = 'ipcam.power-settings.v1';
+const STORAGE_LAYOUT_KEY = 'ipcam.layout-mode.v1';
+
+const cameraUiState = new Map(); // cameraId -> { visible: boolean, audible: boolean }
+const cameraConfigById = new Map(); // cameraId -> { name, ip, login, password, port, path }
 
 const audioMonitor = {
   enabled: false,
@@ -27,6 +31,27 @@ const audioMonitor = {
 };
 
 let mediaUnlocked = false;
+let editingCameraId = null;
+
+function ensureCameraUiState(cameraId) {
+  if (!cameraUiState.has(cameraId)) {
+    cameraUiState.set(cameraId, { visible: true, audible: false });
+  }
+  return cameraUiState.get(cameraId);
+}
+
+function getLayoutMode() {
+  const value = localStorage.getItem(STORAGE_LAYOUT_KEY);
+  return value || 'auto';
+}
+
+function setLayoutMode(value) {
+  localStorage.setItem(STORAGE_LAYOUT_KEY, value);
+}
+
+function getVisibleCameras() {
+  return state.cameras.filter((camera) => ensureCameraUiState(camera.id).visible);
+}
 
 // ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -77,6 +102,21 @@ function sanitizeCameraConfig(data) {
     password: String(data.password || ''),
     port: String(data.port || '554').trim() || '554',
     path: String(data.path || '/onvif1').trim() || '/onvif1',
+  };
+}
+
+function getCameraConfigForEdit(cameraId) {
+  const current = cameraConfigById.get(cameraId);
+  if (current) return { ...current };
+
+  const camera = state.cameras.find((c) => c.id === cameraId);
+  return {
+    name: camera ? camera.name : '',
+    ip: '',
+    login: 'admin',
+    password: '',
+    port: '554',
+    path: '/onvif1',
   };
 }
 
@@ -283,6 +323,102 @@ function removeAudioNode(cameraId) {
   audioMonitor.nodes.delete(cameraId);
 }
 
+function updateToggleAllAudioButton() {
+  const btn = document.getElementById('toggle-all-audio-btn');
+  if (!btn) return;
+  const hasAudible = state.cameras.some((camera) => ensureCameraUiState(camera.id).audible);
+  btn.textContent = hasAudible ? 'Desativar todos os áudios' : 'Ativar todos os áudios';
+}
+
+function updateCameraControlButtons(cameraId) {
+  const ui = ensureCameraUiState(cameraId);
+
+  const listItem = document.querySelector(`.cam-item[data-id="${cameraId}"]`);
+  if (listItem) {
+    const btnAudio = listItem.querySelector('.cam-audio-btn');
+    const btnView = listItem.querySelector('.cam-view-btn');
+    if (btnAudio) {
+      btnAudio.textContent = ui.audible ? 'Audio: ON' : 'Audio: OFF';
+      btnAudio.classList.toggle('active', ui.audible);
+    }
+    if (btnView) {
+      btnView.textContent = ui.visible ? 'Visivel: ON' : 'Visivel: OFF';
+      btnView.classList.toggle('active', ui.visible);
+    }
+  }
+
+  const tile = document.querySelector(`.tile[data-id="${cameraId}"]`);
+  if (tile) {
+    const btnMute = tile.querySelector('.btn-mute');
+    if (btnMute) {
+      btnMute.textContent = ui.audible ? '🔊' : '🔇';
+      btnMute.title = ui.audible ? 'Silenciar' : 'Ativar som';
+    }
+  }
+
+  updateToggleAllAudioButton();
+}
+
+function toggleCameraVisibility(cameraId) {
+  const ui = ensureCameraUiState(cameraId);
+  ui.visible = !ui.visible;
+  renderList();
+  renderGrid();
+}
+
+function toggleCameraAudio(cameraId, explicitValue) {
+  const ui = ensureCameraUiState(cameraId);
+  const nextAudible = typeof explicitValue === 'boolean' ? explicitValue : !ui.audible;
+  ui.audible = nextAudible;
+
+  const node = audioMonitor.nodes.get(cameraId);
+  if (node) {
+    setCameraAudible(cameraId, nextAudible);
+  } else {
+    const tile = document.querySelector(`.tile[data-id="${cameraId}"]`);
+    const video = tile ? tile.querySelector('video') : null;
+    if (video) {
+      video.muted = false;
+      video.volume = nextAudible ? 1 : 0;
+    }
+  }
+
+  updateCameraControlButtons(cameraId);
+}
+
+function toggleAllAudio() {
+  const hasAudible = state.cameras.some((camera) => ensureCameraUiState(camera.id).audible);
+  const nextValue = !hasAudible;
+
+  state.cameras.forEach((camera) => {
+    toggleCameraAudio(camera.id, nextValue);
+  });
+}
+
+function persistCameraOrder() {
+  fetch('/api/cameras/reorder', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order: state.cameras.map((c) => c.id) }),
+  }).catch(() => toast('Erro ao salvar ordem', 'error'));
+}
+
+function moveCamera(cameraId, direction) {
+  const idx = state.cameras.findIndex((c) => c.id === cameraId);
+  if (idx < 0) return;
+
+  const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (targetIdx < 0 || targetIdx >= state.cameras.length) return;
+
+  const next = [...state.cameras];
+  const [moved] = next.splice(idx, 1);
+  next.splice(targetIdx, 0, moved);
+  state.cameras = next;
+  renderList();
+  renderGrid();
+  persistCameraOrder();
+}
+
 function getCurrentAudioLevelPercent() {
   let maxLevel = 0;
 
@@ -356,8 +492,9 @@ function updateNoiseUI(level, peak = 0) {
  */
 function gridLayout(n) {
   if (n <= 0) return { cols: 1, rows: 1 };
-  const W = window.innerWidth - 290; // subtract sidebar approx
-  const H = window.innerHeight;
+  const grid = document.getElementById('grid');
+  const W = grid ? Math.max(320, grid.clientWidth) : window.innerWidth;
+  const H = grid ? Math.max(180, grid.clientHeight) : window.innerHeight;
   let bestCols = 1, bestScore = Infinity;
   for (let c = 1; c <= n; c++) {
     const r = Math.ceil(n / c);
@@ -368,6 +505,19 @@ function gridLayout(n) {
     if (score < bestScore) { bestScore = score; bestCols = c; }
   }
   return { cols: bestCols, rows: Math.ceil(n / bestCols) };
+}
+
+function resolveLayout(n) {
+  const mode = getLayoutMode();
+  if (mode === 'auto') return gridLayout(n);
+
+  const parsed = mode.match(/^(\d+)x(\d+)$/);
+  if (!parsed) return gridLayout(n);
+
+  const cols = Math.max(1, parseInt(parsed[1], 10));
+  const minRows = Math.max(1, parseInt(parsed[2], 10));
+  const rows = Math.max(minRows, Math.ceil(n / cols));
+  return { cols, rows };
 }
 
 // ── HLS player management ─────────────────────────────────────────────────
@@ -564,7 +714,9 @@ function createTile(camera) {
 
   video.addEventListener('canplay', () => {
     ensureAudioNode(camera.id, video);
-    setCameraAudible(camera.id, false);
+    const ui = ensureCameraUiState(camera.id);
+    setCameraAudible(camera.id, ui.audible);
+    updateCameraControlButtons(camera.id);
     if (mediaUnlocked) {
       video.muted = false;
       video.play().catch(() => {});
@@ -575,28 +727,7 @@ function createTile(camera) {
   btnMute.addEventListener('click', () => {
     resumeAudioContextIfNeeded();
     unlockMediaPlayback();
-
-    const node = audioMonitor.nodes.get(camera.id);
-    if (node) {
-      const nextAudible = !node.audible;
-      setCameraAudible(camera.id, nextAudible);
-      btnMute.textContent = nextAudible ? '🔊' : '🔇';
-      btnMute.title = nextAudible ? 'Silenciar' : 'Ativar som';
-      return;
-    }
-
-    // Fallback when WebAudio node is unavailable.
-    if (video.volume === 0) {
-      video.muted = false;
-      video.volume = 1;
-      btnMute.textContent = '🔊';
-      btnMute.title = 'Silenciar';
-    } else {
-      video.muted = false;
-      video.volume = 0;
-      btnMute.textContent = '🔇';
-      btnMute.title = 'Ativar som';
-    }
+    toggleCameraAudio(camera.id);
   });
 
   // Fullscreen
@@ -605,6 +736,7 @@ function createTile(camera) {
     if (req) req.call(tile);
   });
 
+  updateCameraControlButtons(camera.id);
   startTileStream(camera, tile, video);
   return tile;
 }
@@ -631,13 +763,14 @@ setInterval(updateDots, 2000);
 
 function renderGrid() {
   const grid   = document.getElementById('grid');
-  const n      = state.cameras.length;
+  const visibleCameras = getVisibleCameras();
+  const visibleIds = new Set(visibleCameras.map((c) => c.id));
+  const n = visibleCameras.length;
 
   // Remove stale tiles
   grid.querySelectorAll('.tile').forEach((tile) => {
-    if (!state.cameras.find((c) => c.id === tile.dataset.id)) {
+    if (!visibleIds.has(tile.dataset.id)) {
       destroyPlayer(tile.dataset.id);
-      reconnectState.delete(tile.dataset.id);
       tile.remove();
     }
   });
@@ -650,8 +783,8 @@ function renderGrid() {
       empty.id = 'empty';
       empty.innerHTML = `
         <div class="empty-icon">📷</div>
-        <p>Nenhuma câmera adicionada</p>
-        <small>Use o painel lateral para adicionar câmeras</small>
+        <p>${state.cameras.length ? 'Nenhuma câmera visível' : 'Nenhuma câmera adicionada'}</p>
+        <small>${state.cameras.length ? 'Ative a visualização no menu lateral' : 'Use o botão + para adicionar câmeras'}</small>
       `;
       document.getElementById('main').appendChild(empty);
     }
@@ -662,17 +795,19 @@ function renderGrid() {
   if (empty) empty.remove();
 
   // Grid dimensions
-  const { cols, rows } = gridLayout(n);
+  const { cols, rows } = resolveLayout(n);
   grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
   grid.style.gridTemplateRows    = `repeat(${rows}, 1fr)`;
 
   // Add tiles in state order, ensuring DOM order matches
-  state.cameras.forEach((camera, idx) => {
+  visibleCameras.forEach((camera, idx) => {
     let tile = grid.querySelector(`.tile[data-id="${camera.id}"]`);
     if (!tile) {
       tile = createTile(camera);
       grid.appendChild(tile);
     }
+    const tileName = tile.querySelector('.tile-name');
+    if (tileName) tileName.textContent = camera.name;
     // Fix DOM order
     const tiles = [...grid.querySelectorAll('.tile')];
     if (tiles[idx] !== tile) grid.insertBefore(tile, tiles[idx] || null);
@@ -689,6 +824,7 @@ function renderList() {
   list.innerHTML = '';
 
   state.cameras.forEach((camera, idx) => {
+    const ui = ensureCameraUiState(camera.id);
     const li = document.createElement('li');
     li.className = 'cam-item';
     li.draggable = true;
@@ -696,13 +832,30 @@ function renderList() {
     li.dataset.index = idx;
 
     li.innerHTML = `
-      <span class="drag-handle" title="Arrastar para reordenar">⠿</span>
       <span class="cam-dot connecting"></span>
-      <span class="cam-name" title="${esc(camera.name)}">${esc(camera.name)}</span>
-      <button class="cam-remove" title="Remover">✕</button>
+      <div class="cam-main">
+        <span class="cam-name" title="${esc(camera.name)}">${esc(camera.name)}</span>
+      </div>
+      <div class="cam-actions">
+        <button class="cam-action cam-up-btn" title="Subir">Subir</button>
+        <button class="cam-action cam-down-btn" title="Descer">Descer</button>
+        <button class="cam-action cam-audio-btn ${ui.audible ? 'active' : ''}" title="Ativar/desativar áudio">${ui.audible ? 'Audio: ON' : 'Audio: OFF'}</button>
+        <button class="cam-action cam-view-btn ${ui.visible ? 'active' : ''}" title="Ativar/desativar visualização">${ui.visible ? 'Visivel: ON' : 'Visivel: OFF'}</button>
+        <button class="cam-action cam-edit-btn" title="Editar câmera">Editar</button>
+        <button class="cam-action danger cam-remove-btn" title="Remover">Remover</button>
+      </div>
     `;
 
-    li.querySelector('.cam-remove').addEventListener('click', () => removeCamera(camera.id));
+    li.querySelector('.cam-up-btn').addEventListener('click', () => moveCamera(camera.id, 'up'));
+    li.querySelector('.cam-down-btn').addEventListener('click', () => moveCamera(camera.id, 'down'));
+    li.querySelector('.cam-audio-btn').addEventListener('click', () => {
+      resumeAudioContextIfNeeded();
+      unlockMediaPlayback();
+      toggleCameraAudio(camera.id);
+    });
+    li.querySelector('.cam-view-btn').addEventListener('click', () => toggleCameraVisibility(camera.id));
+    li.querySelector('.cam-edit-btn').addEventListener('click', () => openEditModal(camera.id));
+    li.querySelector('.cam-remove-btn').addEventListener('click', () => removeCamera(camera.id));
 
     li.addEventListener('dragstart', onDragStart);
     li.addEventListener('dragover',  onDragOver);
@@ -711,6 +864,7 @@ function renderList() {
     li.addEventListener('dragend',   onDragEnd);
 
     list.appendChild(li);
+    updateCameraControlButtons(camera.id);
   });
 }
 
@@ -744,12 +898,7 @@ function onDrop(e) {
 
   renderList();
   renderGrid();
-
-  fetch('/api/cameras/reorder', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ order: next.map((c) => c.id) }),
-  }).catch(() => toast('Erro ao salvar ordem', 'error'));
+  persistCameraOrder();
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -774,6 +923,8 @@ async function addCamera(data) {
   btn.textContent = 'Adicionando…';
   try {
     const cam = await apiFetch('POST', '/api/cameras', data);
+    ensureCameraUiState(cam.id);
+    cameraConfigById.set(cam.id, sanitizeCameraConfig({ ...data, name: cam.name }));
     state.cameras.push(cam);
     const storedKey = upsertStoredCameraConfig(data);
     if (storedKey) cameraConfigKeyById.set(cam.id, storedKey);
@@ -800,6 +951,8 @@ async function removeCamera(id) {
     destroyPlayer(id);
     removeStoredCameraConfigByKey(cameraConfigKeyById.get(id));
     cameraConfigKeyById.delete(id);
+    cameraConfigById.delete(id);
+    cameraUiState.delete(id);
     reconnectState.delete(id);
     state.cameras = state.cameras.filter((c) => c.id !== id);
     renderList();
@@ -807,6 +960,73 @@ async function removeCamera(id) {
     toast('Câmera removida');
   } catch (err) {
     toast(`Erro ao remover: ${err.message}`, 'error');
+  }
+}
+
+function openEditModal(cameraId) {
+  const camera = state.cameras.find((c) => c.id === cameraId);
+  if (!camera) return;
+
+  editingCameraId = cameraId;
+  const cfg = getCameraConfigForEdit(cameraId);
+
+  document.getElementById('e-name').value = cfg.name || camera.name || '';
+  document.getElementById('e-ip').value = cfg.ip || '';
+  document.getElementById('e-login').value = cfg.login || 'admin';
+  document.getElementById('e-pass').value = cfg.password || '';
+  document.getElementById('e-port').value = cfg.port || '554';
+  document.getElementById('e-path').value = cfg.path || '/onvif1';
+
+  document.getElementById('edit-modal').hidden = false;
+}
+
+function closeEditModal() {
+  editingCameraId = null;
+  document.getElementById('edit-modal').hidden = true;
+}
+
+async function saveEditedCamera() {
+  if (!editingCameraId) return;
+
+  const ip = document.getElementById('e-ip').value.trim();
+  const login = document.getElementById('e-login').value.trim();
+  const password = document.getElementById('e-pass').value;
+  const name = document.getElementById('e-name').value.trim();
+  const port = document.getElementById('e-port').value;
+  const rtspPath = document.getElementById('e-path').value.trim() || '/onvif1';
+
+  if (!ip || !login || !password) {
+    toast('Preencha IP, login e senha para editar', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('edit-save-btn');
+  btn.disabled = true;
+  btn.textContent = 'Salvando...';
+
+  try {
+    const payload = { name: name || ip, ip, login, password, port, path: rtspPath };
+    const cam = await apiFetch('PUT', `/api/cameras/${editingCameraId}`, payload);
+
+    const idx = state.cameras.findIndex((c) => c.id === editingCameraId);
+    if (idx >= 0) state.cameras[idx] = { ...state.cameras[idx], name: cam.name };
+
+    cameraConfigById.set(editingCameraId, sanitizeCameraConfig(payload));
+
+    const oldKey = cameraConfigKeyById.get(editingCameraId);
+    if (oldKey) removeStoredCameraConfigByKey(oldKey);
+    const newKey = upsertStoredCameraConfig(payload);
+    if (newKey) cameraConfigKeyById.set(editingCameraId, newKey);
+
+    closeEditModal();
+    renderList();
+    renderGrid();
+    toast('Câmera atualizada e reconectada', 'success');
+  } catch (err) {
+    toast(`Erro ao editar: ${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Salvar';
   }
 }
 
@@ -861,6 +1081,47 @@ document.getElementById('audio-threshold').addEventListener('input', (e) => {
   savePowerSettings();
 });
 
+document.getElementById('layout-mode').addEventListener('change', (e) => {
+  const value = String(e.target.value || 'auto');
+  setLayoutMode(value);
+  renderGrid();
+});
+
+document.getElementById('toggle-all-audio-btn').addEventListener('click', () => {
+  resumeAudioContextIfNeeded();
+  unlockMediaPlayback();
+  toggleAllAudio();
+});
+
+document.getElementById('fullscreen-btn').addEventListener('click', () => {
+  const elem = document.documentElement;
+  if (!document.fullscreenElement) {
+    const req = elem.requestFullscreen || elem.webkitRequestFullscreen;
+    if (req) req.call(elem);
+    return;
+  }
+  const exit = document.exitFullscreen || document.webkitExitFullscreen;
+  if (exit) exit.call(document);
+});
+
+document.getElementById('add-toggle-btn').addEventListener('click', () => {
+  const addSection = document.getElementById('add-section');
+  addSection.hidden = !addSection.hidden;
+});
+
+document.getElementById('edit-cancel-btn').addEventListener('click', () => {
+  closeEditModal();
+});
+
+document.getElementById('edit-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await saveEditedCamera();
+});
+
+document.getElementById('edit-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'edit-modal') closeEditModal();
+});
+
 async function restoreSavedCameras() {
   const saved = getStoredCameraConfigs();
   if (!saved.length) return;
@@ -890,6 +1151,11 @@ function applyPowerSettingsUI() {
   updateNoiseUI(0, 0);
   setupAudioContextAutoResume();
   ensureAudioWatchLoop();
+
+  const layoutMode = getLayoutMode();
+  const layoutSelect = document.getElementById('layout-mode');
+  if (layoutSelect) layoutSelect.value = layoutMode;
+  updateToggleAllAudioButton();
 }
 
 // ── Sidebar collapse ──────────────────────────────────────────────────────
@@ -943,6 +1209,7 @@ function setupHealthMonitor() {
   try {
     const cameras = await apiFetch('GET', '/api/cameras');
     state.cameras = cameras;
+    state.cameras.forEach((camera) => ensureCameraUiState(camera.id));
     renderList();
     renderGrid();
     if (state.cameras.length === 0) {

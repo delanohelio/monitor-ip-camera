@@ -10,6 +10,9 @@ const os     = require('os');
 const PORT       = parseInt(process.env.PORT) || 3000;
 const STREAMS_DIR = path.join(os.tmpdir(), 'ipcam-streams');
 const PUBLIC_DIR  = path.join(__dirname, 'public');
+const configuredToken = (process.env.ACCESS_TOKEN || process.env.IPCAM_ACCESS_TOKEN || '').trim();
+const ACCESS_TOKEN = configuredToken || crypto.randomBytes(24).toString('base64url');
+const ACCESS_TOKEN_SOURCE = configuredToken ? 'env' : 'generated';
 
 /** In-memory state */
 const cameras    = new Map(); // id -> { id, name, rtspUrl, process, hlsDir, transportIndex, forceTranscode }
@@ -77,6 +80,21 @@ function isValidUUID(s) {
 /** Allow IPv4 and simple hostnames */
 function isValidHost(s) {
   return /^[\w.-]{1,253}$/.test(s) && !/\.\./.test(s);
+}
+
+function parseCookies(cookieHeader) {
+  const out = {};
+  if (!cookieHeader) return out;
+
+  cookieHeader.split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx <= 0) return;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    out[key] = decodeURIComponent(val);
+  });
+
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,10 +246,24 @@ const server = http.createServer(async (req, res) => {
   const urlObj   = new URL(req.url, 'http://localhost');
   const pathname = urlObj.pathname;
   const method   = req.method;
+  const tokenFromQuery = urlObj.searchParams.get('token');
+  const cookies = parseCookies(req.headers.cookie || '');
+  const tokenFromCookie = cookies.ipcam_token;
+  const hasValidToken = tokenFromQuery === ACCESS_TOKEN || tokenFromCookie === ACCESS_TOKEN;
 
   // Security headers
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+
+  if (!hasValidToken) {
+    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Acesso negado. Use ?token=<seu-token> na URL.');
+    return;
+  }
+
+  if (tokenFromQuery === ACCESS_TOKEN && tokenFromCookie !== ACCESS_TOKEN) {
+    res.setHeader('Set-Cookie', `ipcam_token=${encodeURIComponent(ACCESS_TOKEN)}; Path=/; HttpOnly; SameSite=Lax`);
+  }
 
   if (method === 'OPTIONS') {
     res.writeHead(204);
@@ -390,12 +422,61 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, { success: true });
   }
 
+  // ── PUT /api/cameras/:id ──────────────────────────────────────────────────
+  if (method === 'PUT') {
+    const m = pathname.match(/^\/api\/cameras\/([^/]+)$/);
+    if (m) {
+      const id = m[1];
+      if (!isValidUUID(id) || !cameras.has(id)) {
+        return sendJSON(res, 404, { error: 'Câmera não encontrada' });
+      }
+
+      const body = await readBody(req);
+      const { name, ip, login, password, port, path: streamPath } = body;
+
+      if (!ip || typeof ip !== 'string' ||
+          !login || typeof login !== 'string' ||
+          !password || typeof password !== 'string') {
+        return sendJSON(res, 400, { error: 'ip, login e password são obrigatórios' });
+      }
+      if (!isValidHost(ip)) {
+        return sendJSON(res, 400, { error: 'IP/host inválido' });
+      }
+
+      const rtspPort = parseInt(port) || 554;
+      if (rtspPort < 1 || rtspPort > 65535) {
+        return sendJSON(res, 400, { error: 'Porta inválida' });
+      }
+
+      const rtspPath = (streamPath || '/onvif1').trim();
+      if (!/^\/[\w/.@-]*$/.test(rtspPath)) {
+        return sendJSON(res, 400, { error: 'Caminho de stream inválido' });
+      }
+
+      const camera = cameras.get(id);
+      const camName = String(name || ip).slice(0, 100);
+      const rtspUrl = `rtsp://${encodeURIComponent(login)}:${encodeURIComponent(password)}@${ip}:${rtspPort}${rtspPath}`;
+
+      stopStream(camera);
+      camera.name = camName;
+      camera.rtspUrl = rtspUrl;
+      camera.transportIndex = 0;
+      camera.forceTranscode = false;
+      startStream(camera);
+
+      return sendJSON(res, 200, { id: camera.id, name: camera.name });
+    }
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
 server.listen(PORT, () => {
   console.log(`\n  IP Camera Monitor  →  http://localhost:${PORT}\n`);
+  console.log(`  Token (${ACCESS_TOKEN_SOURCE}) : ${ACCESS_TOKEN}`);
+  console.log(`  Acesso: http://localhost:${PORT}/?token=${ACCESS_TOKEN}\n`);
+  console.log('  Docker: passe -e ACCESS_TOKEN=<seu-token> para definir token fixo.');
   console.log('  Certifique-se que o ffmpeg está instalado.\n');
 });
 

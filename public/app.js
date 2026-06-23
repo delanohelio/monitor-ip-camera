@@ -908,10 +908,38 @@ window.addEventListener('resize', () => {
   if (state.cameras.length > 0) renderGrid();
 });
 
+// ── Health monitor: detect and auto-reconnect stale streams ─────────────────
+
+function setupHealthMonitor() {
+  setInterval(async () => {
+    try {
+      const health = await apiFetch('GET', '/api/cameras/health');
+      if (!Array.isArray(health)) return;
+
+      health.forEach((cam) => {
+        if (cam.staleSince && cam.staleSince > 20000) {
+          const tile = document.getElementById(`tile-${cam.id}`);
+          const title = cam.name || `Camera ${cam.id.slice(0, 8)}`;
+
+          console.warn(`[HEALTH] ${title}: stream stale for ${(cam.staleSince / 1000).toFixed(1)}s → reconnecting`);
+          toast(`${title}: reconectando (stream travado)`, 'warn');
+
+          // Auto-reconnect without user action
+          reconnectCamera(cam.id);
+        }
+      });
+    } catch (err) {
+      // Silently ignore health check errors to avoid spam
+      console.debug('[HEALTH] check failed:', err.message);
+    }
+  }, 15000); // Check every 15 seconds
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────
 
 (async function init() {
   applyPowerSettingsUI();
+  setupHealthMonitor();
   try {
     const cameras = await apiFetch('GET', '/api/cameras');
     state.cameras = cameras;

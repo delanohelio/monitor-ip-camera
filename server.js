@@ -209,6 +209,7 @@ function startStream(camera) {
 
   camera.process = proc;
   camera.hlsDir  = hlsDir;
+  camera.lastHlsUpdate = Date.now();
 }
 
 function stopStream(camera) {
@@ -269,7 +270,32 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(403); res.end('Forbidden'); return;
     }
 
+    // Update lastHlsUpdate timestamp on successful HLS read
+    fs.stat(filePath, (err) => {
+      if (!err) {
+        camera.lastHlsUpdate = Date.now();
+      }
+    });
+
     return sendFile(res, filePath);
+  }
+
+  // ── GET /api/cameras/health ───────────────────────────────────────────────
+  if (method === 'GET' && pathname === '/api/cameras/health') {
+    const health = cameraOrder
+      .filter((id) => cameras.has(id))
+      .map((id) => {
+        const c = cameras.get(id);
+        const isRunning = !!c.process;
+        const timeSinceUpdate = Date.now() - (c.lastHlsUpdate || 0);
+        return {
+          id: c.id,
+          name: c.name,
+          running: isRunning,
+          staleSince: timeSinceUpdate > 20000 ? timeSinceUpdate : null, // null = OK, >20s = stale
+        };
+      });
+    return sendJSON(res, 200, health);
   }
 
   // ── GET /api/cameras ────────────────────────────────────────────────────
@@ -372,6 +398,29 @@ server.listen(PORT, () => {
   console.log(`\n  IP Camera Monitor  →  http://localhost:${PORT}\n`);
   console.log('  Certifique-se que o ffmpeg está instalado.\n');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream health checker: auto-restart streams that haven't updated in 20+ seconds
+// ─────────────────────────────────────────────────────────────────────────────
+
+setInterval(() => {
+  const now = Date.now();
+  cameras.forEach((camera) => {
+    if (!camera.process) return; // Skip if not running
+
+    const timeSinceUpdate = now - (camera.lastHlsUpdate || 0);
+    if (timeSinceUpdate > 20000) { // Stale for >20 seconds
+      console.log(
+        `[cam:${camera.id.slice(0, 8)}] ⚠️  HLS stale for ${(timeSinceUpdate / 1000).toFixed(1)}s. ` +
+        `Restarting stream…`
+      );
+      stopStream(camera);
+      setTimeout(() => {
+        if (cameras.has(camera.id)) startStream(camera);
+      }, 500);
+    }
+  });
+}, 10000); // Check every 10 seconds
 
 // Graceful shutdown
 function shutdown() {

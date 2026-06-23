@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitor IP Camera</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- hls.js: biblioteca de reprodução HLS para navegadores não-Safari -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Sidebar ── -->
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <span id="sidebar-title">📷 IP Camera Monitor</span>
+        <button id="collapse-btn" title="Recolher painel">◀</button>
+      </div>
+
+      <div id="add-section">
+        <h2 class="section-title">Adicionar Câmera</h2>
+        <form id="add-form" autocomplete="off" novalidate>
+          <div class="field">
+            <label for="f-name">Nome</label>
+            <input type="text" id="f-name" placeholder="Câmera 1" maxlength="100">
+          </div>
+          <div class="field">
+            <label for="f-ip">IP <span class="req">*</span></label>
+            <input type="text" id="f-ip" value="192.168.1." placeholder="192.168.1.100" required maxlength="253">
+          </div>
+          <div class="field">
+            <label for="f-login">Login <span class="req">*</span></label>
+            <input type="text" id="f-login" value="admin" placeholder="admin" required maxlength="100">
+          </div>
+          <div class="field">
+            <label for="f-pass">Senha <span class="req">*</span></label>
+            <input type="password" id="f-pass" placeholder="••••••••" required maxlength="200" autocomplete="new-password">
+          </div>
+          <details class="advanced">
+            <summary>Opções avançadas</summary>
+            <div class="field">
+              <label for="f-port">Porta RTSP</label>
+              <input type="number" id="f-port" value="554" min="1" max="65535">
+            </div>
+            <div class="field">
+              <label for="f-path">Caminho</label>
+              <input type="text" id="f-path" value="/onvif1" maxlength="200">
+            </div>
+          </details>
+          <button type="submit" id="add-btn">+ Adicionar</button>
+        </form>
+      </div>
+
+      <div id="list-section">
+        <h2 class="section-title">Câmeras <span id="cam-count">(0)</span></h2>
+        <ul id="cam-list"></ul>
+
+        <div id="power-section">
+          <h2 class="section-title">Economia de Energia</h2>
+          <label class="check-row" for="audio-watch-enabled">
+            <input type="checkbox" id="audio-watch-enabled">
+            <span>Despertar com áudio</span>
+          </label>
+          <div class="noise-widget">
+            <div class="noise-head">
+              <span>Ruído</span>
+              <span>
+                <span id="noise-level-text">0%</span>
+                <span class="noise-sep">|</span>
+                <span class="noise-peak">Pico</span>
+                <span id="noise-peak-text">0%</span>
+              </span>
+            </div>
+            <div class="noise-bar">
+              <div id="noise-level-fill"></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="audio-threshold">Limiar de áudio: <span id="audio-threshold-value">18</span></label>
+            <input type="range" id="audio-threshold" min="2" max="80" step="1" value="18">
+          </div>
+          <button id="blackout-btn" type="button">Ativar Tela Preta</button>
+          <p id="power-hint">Com a tela preta ativa, o vídeo volta automaticamente quando o áudio superar o limiar.</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ── Main grid ── -->
+    <main id="main">
+      <button id="expand-btn" title="Abrir painel" hidden>▶</button>
+      <div id="grid"></div>
+    </main>
+
+  </div>
+
+  <div id="blackout-overlay" hidden>
+    <div class="blackout-inner">
+      <div class="noise-widget noise-widget-overlay">
+        <div class="noise-head">
+          <span>Ruído</span>
+          <span>
+            <span id="noise-level-text-overlay">0%</span>
+            <span class="noise-sep">|</span>
+            <span class="noise-peak">Pico</span>
+            <span id="noise-peak-text-overlay">0%</span>
+          </span>
+        </div>
+        <div class="noise-bar">
+          <div id="noise-level-fill-overlay"></div>
+        </div>
+      </div>
+      <button id="blackout-exit-btn" type="button">Mostrar Tela</button>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

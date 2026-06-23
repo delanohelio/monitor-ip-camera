@@ -1,0 +1,12 @@
+{
+  "name": "monitor-ip-camera",
+  "version": "1.0.0",
+  "description": "Web app para monitoramento de câmeras IP via RTSP",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
